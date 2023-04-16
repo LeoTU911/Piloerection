@@ -185,8 +185,8 @@ def video2Img(filePath):
     
 
 
-# call the main function
-filePath = 'D:\\downloads\\Piloerection\\video'
-video2Img(filePath)
+## call the main function
+#filePath = 'D:\\downloads\\Piloerection\\video'
+#video2Img(filePath)
 
 
