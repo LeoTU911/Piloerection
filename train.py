@@ -132,7 +132,7 @@ if __name__ == '__main__':
     parser.add_argument('--data-path',  type=str, default="/dataset")
     parser.add_argument('--model-name', type=str, default='vit')
 
-    # 预训练权重路径，如果不想载入就设置为空字符
+    # 预训练权重路径
     parser.add_argument('--weights', 
                         type=str, 
                         default='./vit_base_patch16_224.pth',
