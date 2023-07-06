@@ -1,0 +1,196 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Apr 16 20:27:41 2023
+
+@author: Chunhui TU
+"""
+
+import os
+import math
+import argparse
+
+import torch
+import torch.optim as optim
+import torch.optim.lr_scheduler as lr_scheduler
+from torch.utils.tensorboard import SummaryWriter
+from torchvision import transforms
+
+
+from imgPreProcessing import MyDataSet
+from utils import read_split_data, train_one_epoch, evaluate
+
+# Models
+from Model.ViT import vit_base_patch16_224 as create_model_base
+from Model.ViT import vit_large_patch16_224 as create_model_large
+from Model.AlexNet import AlexNet
+
+
+
+def main(args):
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
+    if os.path.exists("./weights") is False:
+        os.makedirs("./weights")
+
+    tb_writer = SummaryWriter()
+
+    train_images_path, train_images_label, val_images_path, val_images_label = read_split_data(args.data_path)
+
+    data_transform = {
+        "train": transforms.Compose([transforms.RandomResizedCrop(224),
+                                     transforms.RandomHorizontalFlip(),
+                                     transforms.ToTensor(),
+                                     transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])]),
+        "val": transforms.Compose([transforms.Resize(256),
+                                   transforms.CenterCrop(224),
+                                   transforms.ToTensor(),
+                                   transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])])}
+
+    # Instantiate the training dataset
+    train_dataset = MyDataSet(images_path=train_images_path,
+                              images_class=train_images_label,
+                              transform=data_transform["train"])
+
+    # Instantiate the validation dataset
+    val_dataset = MyDataSet(images_path=val_images_path,
+                            images_class=val_images_label,
+                            transform=data_transform["val"])
+
+    batch_size = args.batch_size
+    nw = min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8])  # number of workers
+    print('Using {} dataloader workers every process'.format(nw))
+    train_loader = torch.utils.data.DataLoader(train_dataset,
+                                               batch_size=batch_size,
+                                               shuffle=True,
+                                               pin_memory=True,
+                                               num_workers=nw,
+                                               collate_fn=train_dataset.collate_fn)
+
+    val_loader = torch.utils.data.DataLoader(val_dataset,
+                                             batch_size=batch_size,
+                                             shuffle=False,
+                                             pin_memory=True,
+                                             num_workers=nw,
+                                             collate_fn=val_dataset.collate_fn)
+    
+    # create model
+    models = ['vit_base', 'vit_large', 'AlexNet']
+    
+    if args.model_name == 'vit_base':
+        print('train vit_base model')
+        model = create_model_base(num_classes=args.num_classes).to(device)
+    elif args.model_name == 'vit_large':
+        print('train vit_large model')
+        model = create_model_large(num_classes=args.num_classes).to(device)
+    elif args.model_name == 'AlexNet':
+        print('train AlexNet model')
+        model = AlexNet(num_classes=args.num_classes, init_weights=False).to(device)
+    else:
+        assert args.model_name in models, "model name should be 'vit_base', 'vit_large' or 'AlexNet'"
+
+    # ViT Models only
+    if args.model_name == 'vit_base' or args.model_name == 'vit_large':
+        if args.weights != "":
+            assert os.path.exists(args.weights), "weights file: '{}' not exist.".format(args.weights)
+            weights_dict = torch.load(args.weights, map_location=device)
+            # remove unnecessary weights
+            del_keys = ['head.weight', 'head.bias'] if model.has_logits \
+                else ['pre_logits.fc.weight', 'pre_logits.fc.bias', 'head.weight', 'head.bias']
+            for k in del_keys:
+                del weights_dict[k]
+            print(model.load_state_dict(weights_dict, strict=False))
+
+        if args.freeze_layers:
+            for name, para in model.named_parameters():
+                # Except head, pre_logits, all other weights are frozen
+                if "head" not in name and "pre_logits" not in name:
+                    para.requires_grad_(False)
+                else:
+                    print("training {}".format(name))
+                    
+    # optimizer, SGD or Adam
+    optimizer_name = args.optimizer
+    if optimizer_name == 'SGD':
+        pg = [p for p in model.parameters() if p.requires_grad]
+        optimizer = optim.SGD(pg, lr=args.lr, momentum=0.9, weight_decay=5E-5)
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=args.lr)
+        
+    # Scheduler https://arxiv.org/pdf/1812.01187.pdf
+    lf = lambda x: ((1 + math.cos(x * math.pi / args.epochs)) / 2) * (1 - args.lrf) + args.lrf  # cosine
+    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
+
+    # record the best result
+    best_acc = 0.0
+    best_epoch = 0
+    for epoch in range(args.epochs):
+        # sign of whether is the best model
+        save_best  = False
+        
+        # train
+        train_loss, train_acc = train_one_epoch(model=model,
+                                                optimizer=optimizer,
+                                                data_loader=train_loader,
+                                                device=device,
+                                                epoch=epoch)
+
+        scheduler.step()
+
+        # validate
+        val_loss, val_acc = evaluate(model=model,
+                                     data_loader=val_loader,
+                                     device=device,
+                                     epoch=epoch)
+
+        tags = ["train_loss", "train_acc", "val_loss", "val_acc", "learning_rate"]
+        tb_writer.add_scalar(tags[0], train_loss, epoch)
+        tb_writer.add_scalar(tags[1], train_acc, epoch)
+        tb_writer.add_scalar(tags[2], val_loss, epoch)
+        tb_writer.add_scalar(tags[3], val_acc, epoch)
+        tb_writer.add_scalar(tags[4], optimizer.param_groups[0]["lr"], epoch)
+        
+        if val_acc > best_acc:
+            save_best  = True
+            best_acc   = val_acc
+            best_epoch = epoch
+        
+        # save weights
+        if args.save_best_weights == 'True':
+            # only save weights of best accuracy
+            if save_best:
+                torch.save(model.state_dict(), "./weights/{}-{}.pth".format(args.model_name, epoch))
+        else:
+            # save weights at each epoch
+            torch.save(model.state_dict(), "./weights/{}-{}.pth".format(args.model_name, epoch))
+    
+    print('Finished Training, The best accuracy rate is {}, which appears in the {}th epoch'.format(best_acc, best_epoch))
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--num_classes', type=int,   default=3)
+    parser.add_argument('--epochs',      type=int,   default=10)
+    parser.add_argument('--batch_size',  type=int,   default=8)
+    parser.add_argument('--lr',          type=float, default=0.001)
+    parser.add_argument('--lrf',         type=float, default=0.01)
+
+    # The root directory of the dataset
+    parser.add_argument('--data_path',  type=str, default="./dataset")
+    parser.add_argument('--model_name', type=str, default='vit_base')
+    # weights save method
+    parser.add_argument('--save_best_weights', type=str, default='True')
+
+    # Pre-training weight path, if you do not want to load, set it to an empty character
+    parser.add_argument('--weights', 
+                        type=str, 
+                        default='./vit_base_patch16_224.pth',
+                        help='initial weights path')
+    # Whether to freeze the weight
+    parser.add_argument('--freeze_layers', type=bool, default=True)
+    parser.add_argument('--device', default='cuda:0', help='device id (i.e. 0 or 0,1 or cpu)')
+    # optimizer
+    parser.add_argument('--optimizer',   type=str,   default='SGD')
+
+    opt = parser.parse_args()
+
+    main(opt)
