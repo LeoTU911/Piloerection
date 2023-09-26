@@ -4,10 +4,6 @@
 Created on Thu Apr 13 16:19:36 2023
 
 @author: Chunhui TU
-
-Adapted from rwightman
-original code from:
-https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
 """
 
 from functools import partial
